@@ -1,0 +1,393 @@
+#!/bin/bash
+# sdi-coach - Unified launcher for sdi.coach
+#
+# Task 7.2.1: Launcher script
+#
+# This script:
+# - Checks Apple Silicon requirement (MLX requires M1/M2/M3)
+# - Starts the Python backend server
+# - Builds and runs the Swift CLI
+# - Handles graceful shutdown of both processes
+
+set -e
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+BACKEND_DIR="$PROJECT_ROOT/backend"
+SOCKET_PATH="${SDICOACH_SOCKET_PATH:-/tmp/sdicoach.sock}"
+PID_FILE="/tmp/sdicoach_backend.pid"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+log_info() {
+    echo -e "${BLUE}ℹ${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $1"
+}
+
+print_banner() {
+    echo -e "${CYAN}"
+    cat << 'EOF'
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║  ▐▛███▜▌ sdi.coach - System Design Interview Coach            ║
+    ║   ▗▗ ▗▗  AI-powered mock interviews with real-time feedback   ║
+    ║  ▐█████▌ Version 0.1.0                                        ║
+    ╚═══════════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}"
+}
+
+check_apple_silicon() {
+    local arch=$(uname -m)
+    if [[ "$arch" != "arm64" ]]; then
+        log_error "sdi.coach requires Apple Silicon (M1/M2/M3/M4)"
+        log_error "Current architecture: $arch"
+        exit 1
+    fi
+    log_success "Apple Silicon detected"
+}
+
+check_python() {
+    if ! command -v python3 &> /dev/null; then
+        log_error "Python 3 is required but not installed"
+        exit 1
+    fi
+
+    local python_version=$(python3 --version 2>&1 | awk '{print $2}')
+    local major=$(echo "$python_version" | cut -d. -f1)
+    local minor=$(echo "$python_version" | cut -d. -f2)
+
+    if [[ "$major" -lt 3 ]] || [[ "$major" -eq 3 && "$minor" -lt 10 ]]; then
+        log_error "Python 3.10+ is required (found $python_version)"
+        exit 1
+    fi
+    log_success "Python $python_version detected"
+}
+
+check_swift() {
+    if ! command -v swift &> /dev/null; then
+        log_error "Swift is required but not installed"
+        log_error "Please install Xcode or Swift toolchain"
+        exit 1
+    fi
+
+    local swift_version=$(swift --version 2>&1 | head -1 | awk '{print $4}')
+    log_success "Swift $swift_version detected"
+}
+
+setup_python_venv() {
+    local venv_path="$BACKEND_DIR/.venv"
+
+    if [[ ! -d "$venv_path" ]]; then
+        log_info "Creating Python virtual environment..."
+        python3 -m venv "$venv_path"
+        log_success "Virtual environment created"
+    fi
+
+    # Activate virtual environment
+    source "$venv_path/bin/activate"
+
+    # Install dependencies if needed
+    if [[ -f "$BACKEND_DIR/pyproject.toml" ]]; then
+        if ! pip show strands-agents &> /dev/null 2>&1; then
+            log_info "Installing Python dependencies..."
+            pip install -e "$BACKEND_DIR" --quiet
+            log_success "Dependencies installed"
+        fi
+    fi
+}
+
+check_models() {
+    local cache_dir="${SDICOACH_MODEL_PATH:-$HOME/.cache/huggingface/hub}"
+    # Check if whisper model exists (approximate check)
+    if ls "$cache_dir"/models--mlx-community--whisper* &> /dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+download_models() {
+    log_info "Downloading ML models (this may take a while)..."
+
+    # Download Whisper model
+    log_info "Downloading MLX-Whisper (large-v3-mlx)..."
+    python3 -c "import mlx_whisper; mlx_whisper.transcribe('', path_or_hf_repo='mlx-community/whisper-large-v3-mlx')" 2>/dev/null || true
+
+    # Download TTS model
+    log_info "Downloading Qwen3-TTS (Base-8bit)..."
+    python3 -c "from mlx_audio.tts.utils import load_model; load_model('mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit')" 2>/dev/null || true
+
+    log_success "Models downloaded successfully"
+}
+
+prompt_model_download() {
+    echo ""
+    echo "====================================="
+    echo "sdi.coach requires ML models:"
+    echo ""
+    echo "  - MLX-Whisper (large-v3-mlx)    ~3.0GB"
+    echo "  - Qwen3-TTS (1.7B-Base-8bit)    ~2.0GB"
+    echo ""
+    echo "  Total: ~5GB"
+    echo ""
+
+    if [[ "$YES_FLAG" == "true" ]]; then
+        download_models
+        return
+    fi
+
+    read -p "Download now? [Y/n]: " response
+    case "$response" in
+        [nN][oO]|[nN])
+            log_warning "Models not downloaded. Run 'sdi-coach init' later."
+            return 1
+            ;;
+        *)
+            download_models
+            ;;
+    esac
+    echo "====================================="
+    echo ""
+}
+
+build_swift() {
+    log_info "Building Swift CLI..."
+    cd "$PROJECT_ROOT"
+
+    if swift build -c release 2>&1; then
+        log_success "Swift CLI built successfully"
+    else
+        log_error "Swift build failed"
+        exit 1
+    fi
+}
+
+start_backend() {
+    log_info "Starting backend server..."
+
+    # Clean up old socket if exists
+    rm -f "$SOCKET_PATH"
+
+    # Start backend in background
+    cd "$BACKEND_DIR"
+
+    # Load environment variables if .env exists
+    if [[ -f "$PROJECT_ROOT/.env" ]]; then
+        source "$PROJECT_ROOT/.env"
+    fi
+
+    if [[ "$DEBUG" == "true" ]]; then
+        python main.py --debug &
+    else
+        python main.py > /dev/null 2>&1 &
+    fi
+
+    local backend_pid=$!
+    echo "$backend_pid" > "$PID_FILE"
+
+    # Wait for socket to be created
+    local max_wait=30
+    local waited=0
+    while [[ ! -S "$SOCKET_PATH" ]] && [[ $waited -lt $max_wait ]]; do
+        sleep 0.5
+        ((waited++))
+    done
+
+    if [[ -S "$SOCKET_PATH" ]]; then
+        log_success "Backend server started (PID: $backend_pid)"
+    else
+        log_error "Backend server failed to start"
+        kill "$backend_pid" 2>/dev/null || true
+        exit 1
+    fi
+}
+
+stop_backend() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            log_info "Stopping backend server (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+    fi
+    rm -f "$SOCKET_PATH"
+}
+
+run_cli() {
+    cd "$PROJECT_ROOT"
+    local cli_path=".build/release/sdi.coach"
+
+    if [[ ! -f "$cli_path" ]]; then
+        log_error "CLI binary not found. Building..."
+        build_swift
+    fi
+
+    log_info "Starting CLI..."
+    echo ""
+
+    # Pass through arguments to CLI
+    if [[ "$DEBUG" == "true" ]]; then
+        "$cli_path" --debug "$@"
+    else
+        "$cli_path" "$@"
+    fi
+}
+
+cleanup() {
+    log_info "Cleaning up..."
+    stop_backend
+    log_success "Cleanup complete"
+}
+
+# =============================================================================
+# Signal Handlers
+# =============================================================================
+
+trap cleanup EXIT INT TERM
+
+# =============================================================================
+# Command Line Arguments
+# =============================================================================
+
+DEBUG=false
+BUILD_ONLY=false
+BACKEND_ONLY=false
+INIT_MODE=false
+YES_FLAG=false
+CLI_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --debug|-d)
+            DEBUG=true
+            shift
+            ;;
+        --build)
+            BUILD_ONLY=true
+            shift
+            ;;
+        --backend-only)
+            BACKEND_ONLY=true
+            shift
+            ;;
+        init|--download-models)
+            INIT_MODE=true
+            shift
+            ;;
+        --yes|-y)
+            YES_FLAG=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: sdi-coach [COMMAND] [OPTIONS] [CLI_ARGS...]"
+            echo ""
+            echo "Commands:"
+            echo "  init              Download ML models (~2GB)"
+            echo "  start             Start interview session (default)"
+            echo ""
+            echo "Options:"
+            echo "  --debug, -d       Enable debug logging"
+            echo "  --build           Build only, don't run"
+            echo "  --backend-only    Run backend server only"
+            echo "  --yes, -y         Skip confirmation prompts"
+            echo "  --help, -h        Show this help"
+            echo ""
+            echo "CLI Arguments:"
+            echo "  -q, --question    Start with a specific question"
+            echo "  -s, --socket      Custom socket path"
+            echo ""
+            echo "Environment Variables:"
+            echo "  AWS_REGION                     AWS region (default: us-west-2)"
+            echo "  AWS_ACCESS_KEY_ID              AWS access key"
+            echo "  AWS_SECRET_ACCESS_KEY          AWS secret key"
+            echo "  SDICOACH_SOCKET_PATH           Socket path (default: /tmp/sdicoach.sock)"
+            echo "  SDICOACH_MODEL_PATH            Model cache directory"
+            echo "  SDICOACH_LOG_LEVEL             Log level (default: INFO)"
+            exit 0
+            ;;
+        *)
+            CLI_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    # System checks
+    log_info "Checking system requirements..."
+    check_apple_silicon
+    check_python
+    check_swift
+
+    # Setup Python environment
+    setup_python_venv
+
+    # Handle init mode (download models only)
+    if [[ "$INIT_MODE" == "true" ]]; then
+        prompt_model_download
+        log_success "Initialization complete"
+        exit 0
+    fi
+
+    # Build Swift CLI
+    if [[ "$BACKEND_ONLY" != "true" ]]; then
+        build_swift
+    fi
+
+    if [[ "$BUILD_ONLY" == "true" ]]; then
+        log_success "Build complete"
+        exit 0
+    fi
+
+    # Check for models on first run
+    if ! check_models; then
+        log_warning "ML models not found"
+        if ! prompt_model_download; then
+            log_error "Cannot start without ML models. Run 'sdi-coach init' first."
+            exit 1
+        fi
+    fi
+
+    # Start backend
+    start_backend
+
+    if [[ "$BACKEND_ONLY" == "true" ]]; then
+        log_info "Backend server running. Press Ctrl+C to stop."
+        wait
+    else
+        # Run CLI
+        run_cli "${CLI_ARGS[@]}"
+    fi
+}
+
+main
